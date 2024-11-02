@@ -130,7 +130,6 @@ class PredictionService:
     def predict_regular_connection_consumption(
         self, prediction_day: date, connection: GridConnection
     ) -> Series:
-
         # As defined in epic:
         #
         # Companies usually follow a repetitive, weekly pattern
@@ -160,7 +159,7 @@ class PredictionService:
         # TODO: implement:
         pass
 
-    def approximate_yearly_conumption_as_prediction(
+    def approximate_yearly_consumption_as_prediction(
         self, connection: GridConnection, prediction_day: date
     ) -> Series:
         predict_from, predict_to = self.get_prediction_range(prediction_day)
