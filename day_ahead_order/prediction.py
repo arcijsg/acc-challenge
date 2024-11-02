@@ -1,4 +1,5 @@
-from datetime import date
+import pytz
+from datetime import date, datetime
 
 from pandas import Series
 
@@ -45,11 +46,13 @@ class PredictionService:
         # prediction_day:
         # - a naive datetime - assume to be a calendar day in Europe/Amsterdam tzone (CET or CEST)?
         #
+        # TODO: extract preconditions to assertion method
+        # TODO: clarify policy or assume it, documenting my assumptions!
         if prediction_day < date.today():
             # TODO: allow to cross-check predictions with past consumption records?
             #   -> yes: assert prediction_day falls within self.connection [active_from; active_until] date range
             #   -> no: raise ValueError("Prediction day should be in future")
-            #)
+            # )
             pass
 
         if prediction_day == date.today():
@@ -71,22 +74,13 @@ class PredictionService:
             #   -> no: raise ValueError("GridConnection {self.connection} is not active on {prediction_day}")
             pass
 
-        # prediction_day:
-        # - prediction_range (from..to) for historical data (nonsolar/regular) derived from it, in UTC
-        #   ( --> prediction_range, passed to prediction services, would span at least 2 dates when converted to tz-aware UTC range)
-        #
-        # - prediction_day falls in a DST flip/flop date in Netherlands?
-        #   -> no: prediction_range = [-1|-2h previous date; 21:59:59|22:59:59] in UTC
-        #   -> yes: for historical data - check day weekday by weekday, going back in time by a week?
-        #       - for solar consumption forecast:
-        #           - CET -> CEST: prediction_range - shorter by 1h
-        #           - CEST -> CET: prediction_range - longer by 1h (25h timespan in UTC)
-
         # Main algo - predict based on connection type (regular/solar/mixed).
 
         # TODO: properly create new empty Pandas time series
         # TODO: Should we Return empty series, or full list of hours with no-data marker?
-        predicted = Series(dtype=float) # Based upon: https://stackoverflow.com/a/69275860
+        predicted = Series(
+            dtype=float
+        )  # Based upon: https://stackoverflow.com/a/69275860
 
         if connection.prediction_type == PredictionType.regular:
             # As defined in epic:
@@ -117,20 +111,23 @@ class PredictionService:
 
             # TODO: implement:
             # predicted = self.predict_regular_connection_consumption(prediction_day)
+            pass
 
         elif connection.prediction_type == PredictionType.solar:
             # TODO: calculate prediction_range in UCT
 
+            predict_from, predict_to = self.get_prediction_range(prediction_day)
+
             # Can be returned as result - SolarForecastService already indexes
             # series as expected in API contract
             predicted = self.solar_forecast(
-                prediction_range.from,
-                prediction_range.to,
+                predict_from,
+                predict_to,
                 self.connection.latitude,
                 self.connection.longitude,
                 self.connection.solar_plane_declination,
                 self.connection.solar_plane_azimuth,
-                self.connection.solar_rated_power
+                self.connection.solar_rated_power,
             )
 
         elif connection.prediction_type == PredictionType.mixed_solar_regular:
@@ -142,10 +139,13 @@ class PredictionService:
             # • Use remainder to make prediction as is done in “Regular”
             # • Do a separate “Solar” prediction (see previous slide)
             # • Add the two for the resulting prediction
+            pass
 
         else:
-            raise ValueError(f"Unexpected value for GridConnection.prediction_type: {connection.prediction_type}")
-
+            # TODO: include valid values of prediction_type in exception msg
+            raise ValueError(
+                f"Unexpected value for GridConnection.prediction_type: {connection.prediction_type}"
+            )
 
         # >>> [API contract] Return value:
         #
@@ -154,3 +154,56 @@ class PredictionService:
         #      as what's in Netherlands happens to be [00:00 - 00:59] during winter
         #      is last hour of previous date in UTC.
         return predicted
+
+        def approximate_yearly_conumption_as_prediction(
+            self, connection: GridConnection, prediction_day: date
+        ) -> Series:
+            predict_from, predict_to = self.get_prediction_range(prediction_day)
+            hours = date_range(predict_from, predict_to, freq="60T")
+
+            avg_kwh_per_hour = self.avg_hourly_consumption(connection)
+            return Series(index=hours, data=avg_kwh_per_hour)
+
+        def avg_hourly_consumption(self, connection: GridConnection) -> float:
+            """
+            When no suitable historical data available for regular/mixed
+            grid connections, approximate hourly consumption/production based
+            upon historically recorded annual consumption (in kWh).
+
+            Args:
+                connection
+            Returns:
+                float (kWh consumed or produced on average per hour)
+            """
+            # TODO: could refine a bit by taking into account how many leap
+            #   years happened to be during period of:
+            #   [connection.active_from; active_until|today]
+            hours_per_year = 8760  # 365 * 24
+            return connection.standard_yearly_consumption / hours_per_year
+
+        # TODO: return Pandas date_range instead? (https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#generating-ranges-of-timestamps)
+        # TODO: extract to something like datetime_utils.py ?
+        def get_prediction_range(
+            self, day: date, tzone="Europe/Amsterdam"
+        ) -> tuple[datetime, datetime]:
+            """
+            Args:
+                day: (naive) calendar day, as experienced in assumed time zone
+                tzone: by default, Amsterdam time - as product scoped for Dutch market
+            Returns:
+                a tuple with two datetimes in UTC ranging from with first and last second
+                of the period to predict consumption for.
+
+                Usually would span two dates in UTC, and contains a range of 23, 24 or 25 hours.
+            """
+
+            # TODO: adjust by +/- one extra hour if +day+ falls in date when
+            #   DST gets adjusted in target time zone
+
+            assumed_tz = pytz.timezone(tzone)
+            tz_aware_day = datetime(day.year, day.month, day.day, tzinfo=assumed_tz)
+
+            begins = datetime.combine(tz_aware_day, time.min)
+            ends = datetime.combine(tz_aware_day, time.max)
+
+            return (begins.astimezone(pytz.utc), ends.astimezone(pytz.utc))
