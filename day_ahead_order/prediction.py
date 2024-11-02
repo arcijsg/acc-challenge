@@ -3,7 +3,7 @@ from datetime import date, datetime
 
 from pandas import Series
 
-from grid_connection import GridConnection
+from grid_connection import GridConnection, PredictionType
 from historic_consumption_service import HistoricConsumptionService
 from solar_forecast import SolarForecastService
 
