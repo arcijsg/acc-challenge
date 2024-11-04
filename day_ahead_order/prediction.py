@@ -1,11 +1,13 @@
 import pytz
 from datetime import date, datetime
 
-from pandas import Series
+from pandas import concat as df_concat, DataFrame, Series, date_range
 
 from grid_connection import GridConnection, PredictionType
 from historic_consumption_service import HistoricConsumptionService
 from solar_forecast import SolarForecastService
+from utils.datetime import get_prediction_range, last_weekday_before
+from utils.general import is_empty_series
 
 
 class PredictionService:
@@ -36,11 +38,13 @@ class PredictionService:
 
         Returns:
             a time series containing hourly kWh values. Index datetimes are localized in UTC
+            (pandas.date_range(...).tz_convert("UTC"))
         """
 
         # Rough first thoughts:
         # ---------------------
 
+        today = date.today()
         # >>> [API contract] preconditions & args:
         #
         # prediction_day:
@@ -48,14 +52,14 @@ class PredictionService:
         #
         # TODO: extract preconditions to assertion method
         # TODO: clarify policy or assume it, documenting my assumptions!
-        if prediction_day < date.today():
+        if prediction_day < today:
             # TODO: allow to cross-check predictions with past consumption records?
             #   -> yes: assert prediction_day falls within connection [active_from; active_until] date range
             #   -> no: raise ValueError("Prediction day should be in future")
             # )
             pass
 
-        if prediction_day == date.today():
+        if prediction_day == today:
             # TODO: allow partial predictions? It would kind of make sense...
             #   -> yes:
             #      - fill hours already passed with historical data (for regular; available for solar connections?)
@@ -76,12 +80,6 @@ class PredictionService:
 
         # Main algo - predict based on connection type (regular/solar/mixed).
 
-        # TODO: properly create new empty Pandas time series
-        # TODO: Should we Return empty series, or full list of hours with no-data marker?
-        predicted = Series(
-            dtype=float
-        )  # Based upon: https://stackoverflow.com/a/69275860
-
         if connection.prediction_type == PredictionType.regular:
             return self.predict_regular_connection_consumption(
                 prediction_day, connection
@@ -89,10 +87,11 @@ class PredictionService:
 
         elif connection.prediction_type == PredictionType.solar:
             # TODO: extract to method
-            predict_from, predict_to = self.get_prediction_range(prediction_day)
+            full_day = get_prediction_range(prediction_day)
+            predict_from, predict_to = full_day.tz_convert("UTC")
 
-            # SolarForecastService already indexes series by hour (as expected in API contract)
-            return self.solar_forecast(
+            # returned series already indexed by hour (as expected in API contract)
+            return self.solar_forecast_service(
                 predict_from,
                 predict_to,
                 connection.latitude,
@@ -122,48 +121,112 @@ class PredictionService:
         # >>> [API contract] Return value:
         #
         # "Index datetimes are localized in UTC"
-        #   ^ suggests time series to be indexed by full datetimes, not just by hours,
+        #   ^ suggests time series to be indexed by full datetimes, not just by hours?
         #      as what's in Netherlands happens to be [00:00 - 00:59] during winter
         #      is last hour of previous date in UTC.
-        return predicted
+
+        # TODO: properly create new empty Pandas time series
+        # TODO: Should we Return empty series, or full list of hours with no-data marker?
+        # Based upon: https://stackoverflow.com/a/69275860
+        nothing = Series(dtype=float)
+        return nothing
 
     def predict_regular_connection_consumption(
         self, prediction_day: date, connection: GridConnection
     ) -> Series:
-        # As defined in epic:
-        #
-        # Companies usually follow a repetitive, weekly pattern
-        # -> use historic data of similar weekdays to make a prediction:
-        #   • (1) For predicting a Monday, average the values of the past 3 Mondays (same for Tuesday, Wednesday, etc.)
-        #   • (2) If not available, use as many Mondays as available)
-        #   • (3) If no Mondays are present at all, use average yearly value (from GridConnection)
+        """
+        Algorithm as defined in epic:
 
-        # Thoughts:
+        Companies usually follow a repetitive, weekly pattern
+         -> use historic data of similar weekdays to make a prediction:
+            (1) For predicting a Monday, average the values of the past 3 Mondays (same for Tuesday, Wednesday, etc.)
+            (2) If not available, use as many Mondays as available)
+            (3) If no Mondays are present at all, use average yearly value (from GridConnection)
+        """
+
+        # TODO: Refactor me, please!
+
+        # TODO: preconditions
         # - if connection has active_from: ensure we do not request
         #       historical weekday consumption before that
         # - if connection has active_until:
         #       - if connection expired before last weekday_of(prediction_day):
         #           -> skip (1) and begin with (2), beginning from last weekday_of(prediction_day) before connection.active_until
 
-        # (i) HistoricConsumptionService returns time series with step of 15 minutes -
-        #     should we aggregate in pandas DataFrame, and apply a process like
-        #     groupBy [split-apply-combine](https://pandas.pydata.org/pandas-docs/stable/user_guide/groupby.html#group-by-split-apply-combine)
-        #     to returned historical consumoption data
-        #     to get expected time granuality of 60 minutes?
+        # (1) attempt to average hourly historical consumption from last 3
+        #     weekdays the prediction_day falls in.
+        last_weekday = last_weekday_before(prediction_day.weekday())
+        last_3_weeks = [
+            last_weekday - timedelta(weeks=weeks_ago) for weeks_ago in range(3)
+        ]
 
-        # (i) fallback to average yearly consumption -> calculate avg hourly consumption:
-        #   - Assume 365 days per year, as GridConnection has no info of
-        #     how many leap years had contributed to calculating annual consumption
-        #   - avg_hourly_consumption = connection.standard_yearly_consumption / (365 * 24)
+        # FIXME: Intuition suggests a data frame with one of axes consisting of
+        #   hourly periods (not anchored to date?) - but of the same hourly periods
+        #   as the prediction_day contains, as there could be 23 to 25 data points,
+        #   based on DST state of the day.
+        #
+        #   Other axis - labelled by...naive date the historical sample was taken from?
+        #   and consisting of hourly consumption for that day?
+        avg_consumption = DataFrame()
 
-        # TODO: implement:
-        pass
+        for day in last_3_weeks:
+            if not connection.is_active_on(day):
+                # TODO: recheck the assumption by Artūrs that there would be
+                #   no historical data for days when connection contract was
+                #   not active (yet or anymore)?
+                continue
+
+            time_start, time_end = get_prediction_range(day)
+
+            # Historical data gets sampled at granuality of 15 minutes.
+            # We are looking for hourly consumption:
+            hourly_consumption = (
+                self.historic_consumption_service.get_consumption(
+                    connection, time_start, time_end
+                )
+                .resample("1h")
+                .sum()
+            )
+
+            if is_empty_series(hourly_consumption):
+                continue
+
+            # TODO: append to avg_consumption in a way that the data points
+            #   could afterwards be averaged by hour
+            #   using:
+            #   (?) avg_consumption.groupby(...hourly component of all data points...).mean()
+
+        # TODO:
+        # if avg_consumption contains exactly 3 entries:
+        #    - group avg_consumption by hourly component of all data points
+        #    - avg_hourly_consumption =
+        #        average the values within each hourly group (.mean())
+        #    - build a new Series, indexed by hours in prediction_day, expfressed in UTC:
+        #        predict_from, predict_to = get_prediction_range(day)
+        #        hours = date_range(predict_from, predict_to, freq="1h")
+        #        return Series(index=hours, data=avg_hourly_consumption)
+        #
+        #       NOTE: [split-apply-combine](https://pandas.pydata.org/pandas-docs/stable/user_guide/groupby.html#group-by-split-apply-combine)
+        #
+        # else:
+        #    try as many weekdays as available of prediction_day.weekday() withing data period
+        #    from connection.active_from to earliest_of(connection.active_from, date.today())
+        #    (?) impose a sane limit on number of historical days to query for?
+
+        # Fall back to roughly approximating hourly production/consumption
+        # based upon avg yearly consumption for the grid connection in question.
+        return self.approximate_yearly_consumption_as_prediction(
+            connection, prediction_day
+        )
 
     def approximate_yearly_consumption_as_prediction(
         self, connection: GridConnection, prediction_day: date
     ) -> Series:
-        predict_from, predict_to = self.get_prediction_range(prediction_day)
-        hours = date_range(predict_from, predict_to, freq="60T")
+        """
+        Given a grid connection with a known annual consumption
+        """
+        predict_from, predict_to = get_prediction_range(prediction_day)
+        hours = date_range(predict_from, predict_to, freq="1h")
 
         avg_kwh_per_hour = self.avg_hourly_consumption(connection)
         return Series(index=hours, data=avg_kwh_per_hour)
@@ -183,31 +246,6 @@ class PredictionService:
         #   years happened to be during period of:
         #   [connection.active_from; active_until|today]
         hours_per_year = 8760  # 365 * 24
+        # NOTE: we assume that standard_yearly_consumption would contain zero
+        #   if annual consumption is not known (yet) instead None or NaN
         return connection.standard_yearly_consumption / hours_per_year
-
-        # TODO: return Pandas date_range instead? (https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#generating-ranges-of-timestamps)
-        # TODO: extract to something like datetime_utils.py ?
-        def get_prediction_range(
-            self, day: date, tzone="Europe/Amsterdam"
-        ) -> tuple[datetime, datetime]:
-            """
-            Args:
-                day: (naive) calendar day, as experienced in assumed time zone
-                tzone: by default, Amsterdam time - as product scoped for Dutch market
-            Returns:
-                a tuple with two datetimes in UTC ranging from with first and last second
-                of the period to predict consumption for.
-
-                Usually would span two dates in UTC, and contains a range of 23, 24 or 25 hours.
-            """
-
-            # TODO: adjust by +/- one extra hour if +day+ falls in date when
-            #   DST gets adjusted in target time zone
-
-            assumed_tz = pytz.timezone(tzone)
-            tz_aware_day = datetime(day.year, day.month, day.day, tzinfo=assumed_tz)
-
-            begins = datetime.combine(tz_aware_day, time.min)
-            ends = datetime.combine(tz_aware_day, time.max)
-
-            return (begins.astimezone(pytz.utc), ends.astimezone(pytz.utc))
