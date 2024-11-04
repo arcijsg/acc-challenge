@@ -34,7 +34,10 @@ class GridConnection:
             name:
             ean_code: EAN (registration) number
             active_from: (inclusive) First date for which orders should be made
+                ^ [Artūrs] assumed it wuld always contain a moment in the past
             active_until: Marks the first date for which orders shouldn't be sent anymore
+                ^ [Artūrs] should we assume active_until to be None for active
+                  and open-ended contracts with grid connections?
             prediction_type:
             standard_yearly_consumption: kWh used/produced by this connection per year
             latitude: (degrees) of physical location
