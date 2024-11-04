@@ -1,2 +1,6 @@
 envs/*
 .venv
+
+# Compiled/cached bytecode
+__pycache__/
+*.py[cod]
